@@ -22,8 +22,14 @@ require "pipe"
 reader, writer = Pipe.create
 
 spawn do
-  # Avoid generating an entire JSON blob in RAM
-  (1..1_000_000).to_json writer
+  # Avoid generating the entire JSON blob in RAM
+  JSON.build writer do |json|
+    json.array do
+      10_000_000.times do |i|
+        json.scalar i
+      end
+    end
+  end
 ensure
   writer.close
 end
