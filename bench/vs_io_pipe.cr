@@ -6,6 +6,7 @@ require "../src/pipe"
   100,
   1024,
   8192,
+  32768,
   65536,
 ].each do |byte_size|
   puts
