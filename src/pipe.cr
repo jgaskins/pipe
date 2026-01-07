@@ -112,6 +112,7 @@ module Pipe
           elsif @closed
             return 0
           else
+            # The buffer is empty, so wait for the writer
             channel = Channel(Nil).new
             @waiting_reader = channel
           end
