@@ -8,7 +8,6 @@ module Pipe
     {Reader.new(buffer), Writer.new(buffer)}
   end
 
-  # Ring buffer for efficient fixed-size circular storage
   private class Buffer
     @data : Bytes
     @head : Int32 = 0 # Write position
