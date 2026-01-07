@@ -145,7 +145,7 @@ module Pipe
     @buffer : Buffer
     getter? closed : Bool = false
 
-    protected def initialize(@buffer : Buffer)
+    protected def initialize(@buffer)
     end
 
     def read(slice : Bytes) : Int32
@@ -166,7 +166,7 @@ module Pipe
     @buffer : Buffer
     getter? closed : Bool = false
 
-    protected def initialize(@buffer : Buffer)
+    protected def initialize(@buffer)
     end
 
     def read(slice : Bytes) : NoReturn
