@@ -25,34 +25,34 @@ module Pipe
 
     private def available_data : Int32
       if @full
-        @data.size.to_i32
+        @data.size
       elsif @head >= @tail
         @head - @tail
       else
-        @data.size.to_i32 - @tail + @head
+        @data.size - @tail + @head
       end
     end
 
     private def available_space : Int32
-      @data.size.to_i32 - available_data
+      @data.size - available_data
     end
 
     def write(slice : Bytes) : Nil
       remaining = slice
-      while remaining.size > 0
-        channel : Channel(Nil)? = nil
 
+      while remaining.size > 0
+        channel = nil
         @mutex.synchronize do
           raise IO::Error.new("Closed stream") if @closed
 
           space = available_space
           if space > 0
-            to_write = Math.min(space, remaining.size).to_i32
+            to_write = Math.min(space, remaining.size)
 
             # We write in 1-2 chunks. If the first write exceeds the available
             # space at the ened of the buffer, we wrap around to the beginning
             # and write the rest there.
-            first_chunk = Math.min(to_write, @data.size.to_i32 - @head)
+            first_chunk = Math.min(to_write, @data.size - @head)
             remaining[0, first_chunk].copy_to(@data + @head)
 
             if to_write > first_chunk
@@ -60,7 +60,7 @@ module Pipe
               remaining[first_chunk, second_chunk].copy_to(@data)
             end
 
-            @head = (@head + to_write) % @data.size.to_i32
+            @head = (@head + to_write) % @data.size
             @full = (@head == @tail) && to_write > 0
             remaining = remaining[to_write..]
 
@@ -81,18 +81,18 @@ module Pipe
 
     def read(slice : Bytes) : Int32
       loop do
-        channel : Channel(Nil)? = nil
+        channel = nil
 
         @mutex.synchronize do
-          avail = available_data
-          if avail > 0
-            to_read = Math.min(avail, slice.size).to_i32
+          available = available_data
+          if available > 0
+            to_read = Math.min(available, slice.size)
 
             # Just like in writing, the amount we're trying to read may be more
             # than is available at the end of the buffer, which requires
             # wrapping around to the beginning. This means we need to read in 2
             # separate chunks.
-            first_chunk = Math.min(to_read, @data.size.to_i32 - @tail)
+            first_chunk = Math.min(to_read, @data.size - @tail)
             slice.copy_from(@data[@tail, first_chunk])
 
             if to_read > first_chunk
@@ -100,7 +100,7 @@ module Pipe
               slice[first_chunk, second_chunk].copy_from(@data[0, second_chunk])
             end
 
-            @tail = (@tail + to_read) % @data.size.to_i32
+            @tail = (@tail + to_read) % @data.size
             @full = false
 
             if writer = @waiting_writer
