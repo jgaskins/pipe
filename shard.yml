@@ -1,0 +1,9 @@
+name: pipe
+version: 0.1.0
+
+authors:
+  - Jamie Gaskins <jgaskins@hey.com>
+
+crystal: '>= 1.18.2'
+
+license: MIT
