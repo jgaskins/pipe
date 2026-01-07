@@ -50,7 +50,7 @@ module Pipe
             to_write = Math.min(space, remaining.size)
 
             # We write in 1-2 chunks. If the first write exceeds the available
-            # space at the ened of the buffer, we wrap around to the beginning
+            # space at the end of the buffer, we wrap around to the beginning
             # and write the rest there.
             first_chunk = Math.min(to_write, @data.size - @head)
             remaining[0, first_chunk].copy_to(@data + @head)
