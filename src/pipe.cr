@@ -9,7 +9,8 @@ module Pipe
   end
 
   private class Buffer
-    @data : Bytes
+    @data : Pointer(UInt8)
+    @capacity : Int32
     @head : Int32 = 0 # Write position
     @tail : Int32 = 0 # Read position
     @full : Bool = false
@@ -18,8 +19,8 @@ module Pipe
     @mutex : Mutex = Mutex.new
     getter? closed : Bool = false
 
-    def initialize(capacity : Int32)
-      @data = Bytes.new(capacity)
+    def initialize(@capacity : Int32)
+      @data = Pointer(UInt8).malloc(@capacity)
     end
 
     def write(slice : Bytes) : Nil
@@ -37,15 +38,15 @@ module Pipe
             # We write in 1-2 chunks. If the first write exceeds the available
             # space at the end of the buffer, we wrap around to the beginning
             # and write the rest there.
-            first_chunk = Math.min(to_write, @data.size - @head)
-            remaining[0, first_chunk].copy_to(@data + @head)
+            first_chunk = Math.min(to_write, @capacity - @head)
+            (@data + @head).copy_from(remaining.to_unsafe, first_chunk)
 
             if to_write > first_chunk
               second_chunk = to_write - first_chunk
-              remaining[first_chunk, second_chunk].copy_to(@data)
+              @data.copy_from(remaining.to_unsafe + first_chunk, second_chunk)
             end
 
-            @head = (@head + to_write) % @data.size
+            @head = (@head + to_write) % @capacity
             @full = (@head == @tail) && to_write > 0
             remaining = remaining[to_write..]
 
@@ -77,15 +78,15 @@ module Pipe
             # than is available at the end of the buffer, which requires
             # wrapping around to the beginning. This means we need to read in 2
             # separate chunks.
-            first_chunk = Math.min(to_read, @data.size - @tail)
-            slice.copy_from(@data[@tail, first_chunk])
+            first_chunk = Math.min(to_read, @capacity - @tail)
+            slice.to_unsafe.copy_from(@data + @tail, first_chunk)
 
             if to_read > first_chunk
               second_chunk = to_read - first_chunk
-              slice[first_chunk, second_chunk].copy_from(@data[0, second_chunk])
+              (slice.to_unsafe + first_chunk).copy_from(@data, second_chunk)
             end
 
-            @tail = (@tail + to_read) % @data.size
+            @tail = (@tail + to_read) % @capacity
             @full = false
 
             if writer = @waiting_writer
@@ -122,16 +123,16 @@ module Pipe
     end
 
     private def available_space : Int32
-      @data.size - available_data
+      @capacity - available_data
     end
 
     private def available_data : Int32
       if @full
-        @data.size
+        @capacity
       elsif @head >= @tail
         @head - @tail
       else
-        @data.size - @tail + @head
+        @capacity - @tail + @head
       end
     end
   end
