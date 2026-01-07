@@ -13,27 +13,13 @@ module Pipe
     @head : Int32 = 0 # Write position
     @tail : Int32 = 0 # Read position
     @full : Bool = false
-    @closed : Bool = false
     @waiting_reader : Channel(Nil)? = nil
     @waiting_writer : Channel(Nil)? = nil
     @mutex : Mutex = Mutex.new
+    getter? closed : Bool = false
 
     def initialize(capacity : Int32)
       @data = Bytes.new(capacity)
-    end
-
-    private def available_data : Int32
-      if @full
-        @data.size
-      elsif @head >= @tail
-        @head - @tail
-      else
-        @data.size - @tail + @head
-      end
-    end
-
-    private def available_space : Int32
-      @data.size - available_data
     end
 
     def write(slice : Bytes) : Nil
@@ -121,7 +107,7 @@ module Pipe
       end
     end
 
-    def close
+    def close : Nil
       @mutex.synchronize do
         @closed = true
         if reader = @waiting_reader
@@ -135,8 +121,18 @@ module Pipe
       end
     end
 
-    def closed? : Bool
-      @mutex.synchronize { @closed }
+    private def available_space : Int32
+      @data.size - available_data
+    end
+
+    private def available_data : Int32
+      if @full
+        @data.size
+      elsif @head >= @tail
+        @head - @tail
+      else
+        @data.size - @tail + @head
+      end
     end
   end
 
@@ -148,7 +144,7 @@ module Pipe
     end
 
     def read(slice : Bytes) : Int32
-      raise IO::Error.new("Closed stream") if @closed
+      raise IO::Error.new("Closed stream") if closed?
       @buffer.read(slice)
     end
 
@@ -168,7 +164,7 @@ module Pipe
     protected def initialize(@buffer)
     end
 
-    def read(slice : Bytes) : NoReturn
+    def read(slice : Bytes) : Int32
       raise IO::Error.new("Cannot read from a Pipe::Writer")
     end
 
