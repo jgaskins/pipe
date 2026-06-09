@@ -16,7 +16,7 @@ module Pipe
     @full : Bool = false
     @waiting_reader : Channel(Nil)? = nil
     @waiting_writer : Channel(Nil)? = nil
-    @mutex : Mutex = Mutex.new
+    @mutex : Mutex = Mutex.new(:unchecked)
     getter? closed : Bool = false
 
     def initialize(@capacity : Int32)
