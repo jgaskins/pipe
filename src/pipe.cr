@@ -46,7 +46,12 @@ module Pipe
               @data.copy_from(remaining.to_unsafe + first_chunk, second_chunk)
             end
 
-            @head = (@head + to_write) % @capacity
+            # Advance the write position, wrapping around the end of the ring
+            # buffer. `head` stays in `0...@capacity` and we advance by at most
+            # `capacity`, so a single conditional subtraction is equivalent to
+            # (and cheaper than) a modulo by `capacity`.
+            @head &+= to_write
+            @head &-= @capacity if @head >= @capacity
             @full = (@head == @tail) && to_write > 0
             remaining = remaining[to_write..]
 
@@ -78,15 +83,18 @@ module Pipe
             # than is available at the end of the buffer, which requires
             # wrapping around to the beginning. This means we need to read in 2
             # separate chunks.
-            first_chunk = Math.min(to_read, @capacity - @tail)
+            first_chunk = Math.min(to_read, @capacity &- @tail)
             slice.to_unsafe.copy_from(@data + @tail, first_chunk)
 
             if to_read > first_chunk
-              second_chunk = to_read - first_chunk
+              second_chunk = to_read &- first_chunk
               (slice.to_unsafe + first_chunk).copy_from(@data, second_chunk)
             end
 
-            @tail = (@tail + to_read) % @capacity
+            # See the matching note in #write: a conditional subtraction wraps
+            # @tail around the ring buffer more cheaply than a modulo.
+            @tail &+= to_read
+            @tail &-= @capacity if @tail >= @capacity
             @full = false
 
             if writer = @waiting_writer
