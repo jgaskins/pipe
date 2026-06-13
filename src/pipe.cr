@@ -13,7 +13,12 @@ module Pipe
     @capacity : Int32
     @head : Int32 = 0 # Write position
     @tail : Int32 = 0 # Read position
-    @full : Bool = false
+    @size : Int32 = 0 # Bytes currently in the buffer
+    # A reader parks when the buffer is empty; a writer parks when it is full.
+    # Those conditions are mutually exclusive (the buffer can't be both at
+    # once), so at most one side is ever waiting and they can share a single
+    # rendezvous channel rather than allocating a fresh one on every park.
+    @wakeup : Channel(Nil) = Channel(Nil).new
     @waiting_reader : Channel(Nil)? = nil
     @waiting_writer : Channel(Nil)? = nil
     @mutex : Mutex = Mutex.new(:unchecked)
@@ -28,10 +33,12 @@ module Pipe
 
       while remaining.size > 0
         channel = nil
+        wake = nil
+
         @mutex.synchronize do
           raise IO::Error.new("Closed stream") if @closed
 
-          space = available_space
+          space = @capacity &- @size
           if space > 0
             to_write = Math.min(space, remaining.size)
 
@@ -52,32 +59,38 @@ module Pipe
             # (and cheaper than) a modulo by `capacity`.
             @head &+= to_write
             @head &-= @capacity if @head >= @capacity
-            @full = (@head == @tail) && to_write > 0
+            @size &+= to_write
             remaining = remaining[to_write..]
 
             if reader = @waiting_reader
               @waiting_reader = nil
-              reader.send(nil)
+              wake = reader
             end
           else
             # The buffer is full, so we wait for the reader
-            channel = Channel(Nil).new
+            channel = @wakeup
             @waiting_writer = channel
           end
         end
 
+        # Wake the parked reader only after releasing the mutex so it doesn't
+        # resume just to contend for a lock we still hold.
+        wake.try &.send(nil)
         channel.try &.receive?
       end
     end
 
     def read(slice : Bytes) : Int32
+      return 0 if slice.empty?
+
       loop do
         channel = nil
+        wake = nil
+        read_count = 0
 
         @mutex.synchronize do
-          available = available_data
-          if available > 0
-            to_read = Math.min(available, slice.size)
+          if @size > 0
+            to_read = Math.min(@size, slice.size)
 
             # Just like in writing, the amount we're trying to read may be more
             # than is available at the end of the buffer, which requires
@@ -95,23 +108,26 @@ module Pipe
             # @tail around the ring buffer more cheaply than a modulo.
             @tail &+= to_read
             @tail &-= @capacity if @tail >= @capacity
-            @full = false
+            @size &-= to_read
+            read_count = to_read
 
             if writer = @waiting_writer
               @waiting_writer = nil
-              writer.send(nil)
+              wake = writer
             end
-
-            return to_read
           elsif @closed
             return 0
           else
             # The buffer is empty, so wait for the writer
-            channel = Channel(Nil).new
+            channel = @wakeup
             @waiting_reader = channel
           end
         end
 
+        # See the matching note in #write: wake the parked writer only after
+        # releasing the mutex.
+        wake.try &.send(nil)
+        return read_count if read_count > 0
         channel.try &.receive?
       end
     end
@@ -129,31 +145,22 @@ module Pipe
         end
       end
     end
-
-    private def available_space : Int32
-      @capacity - available_data
-    end
-
-    private def available_data : Int32
-      if @full
-        @capacity
-      elsif @head >= @tail
-        @head - @tail
-      else
-        @capacity - @tail + @head
-      end
-    end
   end
 
   class Reader < IO
+    include IO::Buffered
+
     @buffer : Buffer
     getter? closed : Bool = false
 
     protected def initialize(@buffer)
+      # Reading from the ring buffer is just a memcpy, so copying through the
+      # read buffer first costs more than it saves. `#gets` and `#peek` still
+      # use the buffer — `#peek` fills it regardless of this setting.
+      @read_buffering = false
     end
 
-    def read(slice : Bytes) : Int32
-      raise IO::Error.new("Closed stream") if closed?
+    def unbuffered_read(slice : Bytes) : Int32
       @buffer.read(slice)
     end
 
@@ -161,28 +168,54 @@ module Pipe
       raise IO::Error.new("Cannot write to a Pipe::Reader")
     end
 
-    def close : Nil
+    def unbuffered_write(slice : Bytes) : NoReturn
+      raise IO::Error.new("Cannot write to a Pipe::Reader")
+    end
+
+    def unbuffered_flush : Nil
+    end
+
+    def unbuffered_rewind : NoReturn
+      raise IO::Error.new("Cannot rewind a pipe")
+    end
+
+    def unbuffered_close : Nil
       @closed = true
     end
   end
 
   class Writer < IO
+    include IO::Buffered
+
     @buffer : Buffer
     getter? closed : Bool = false
 
     protected def initialize(@buffer)
+      # Match `IO.pipe`: every write is immediately visible to the reader
+      # unless the caller opts into write buffering with `sync = false`.
+      self.sync = true
     end
 
-    def read(slice : Bytes) : Int32
+    def read(slice : Bytes) : NoReturn
       raise IO::Error.new("Cannot read from a Pipe::Writer")
     end
 
-    def write(slice : Bytes) : Nil
-      raise IO::Error.new("Closed stream") if @closed
+    def unbuffered_read(slice : Bytes) : NoReturn
+      raise IO::Error.new("Cannot read from a Pipe::Writer")
+    end
+
+    def unbuffered_write(slice : Bytes) : Nil
       @buffer.write(slice)
     end
 
-    def close : Nil
+    def unbuffered_flush : Nil
+    end
+
+    def unbuffered_rewind : NoReturn
+      raise IO::Error.new("Cannot rewind a pipe")
+    end
+
+    def unbuffered_close : Nil
       return if @closed
       @closed = true
       @buffer.close
