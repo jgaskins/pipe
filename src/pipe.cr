@@ -8,75 +8,101 @@ module Pipe
     {Reader.new(buffer), Writer.new(buffer)}
   end
 
+  # A single-producer/single-consumer ring buffer. Exactly one fiber writes and
+  # one reads (matching `IO.pipe` semantics), which lets us move data without a
+  # lock: the writer owns the head, the reader owns the tail, and each side only
+  # *publishes* its own position and *reads* the other's.
   private class Buffer
     @data : Pointer(UInt8)
     @capacity : Int32
-    @head : Int32 = 0 # Write position
-    @tail : Int32 = 0 # Read position
-    @size : Int32 = 0 # Bytes currently in the buffer
+
+    # Free-running byte counters (total bytes ever written / read). The producer
+    # owns @head_count and the consumer owns @tail_count; each is published with
+    # a release-store and read by the other side with an acquire-load. That
+    # acquire/release pairing is what guarantees the data copy is visible before
+    # the position update — the job the mutex used to do. The number of bytes in
+    # the buffer is just `head - tail` (unsigned subtraction, so the wrap at 2^32
+    # cancels out), so there is no shared `size` field to contend on.
+    @head_count = Atomic(UInt32).new(0)
+    @tail_count = Atomic(UInt32).new(0)
+
+    # The actual ring indices, wrapped into `0...@capacity`. Each is touched by a
+    # single fiber only (@head_index by the writer, @tail_index by the reader),
+    # so they need no synchronization. Keeping them separate from the counters
+    # lets the capacity be any size — we wrap with a conditional subtraction
+    # rather than masking, which would require a power-of-two capacity.
+    @head_index = 0
+    @tail_index = 0
+
     # A reader parks when the buffer is empty; a writer parks when it is full.
-    # Those conditions are mutually exclusive (the buffer can't be both at
-    # once), so at most one side is ever waiting and they can share a single
-    # rendezvous channel rather than allocating a fresh one on every park.
+    # Those conditions are mutually exclusive, so at most one side is ever
+    # waiting and they can share a single rendezvous channel rather than
+    # allocating a fresh one on every park. The waiter slots are atomic so the
+    # park/wake handshake needs no lock either.
     @wakeup : Channel(Nil) = Channel(Nil).new
-    @waiting_reader : Channel(Nil)? = nil
-    @waiting_writer : Channel(Nil)? = nil
-    @mutex : Mutex = Mutex.new(:unchecked)
-    getter? closed : Bool = false
+    @waiting_reader = Atomic(Channel(Nil)?).new(nil)
+    @waiting_writer = Atomic(Channel(Nil)?).new(nil)
+    @closed = Atomic(UInt8).new(0)
 
     def initialize(@capacity : Int32)
       @data = Pointer(UInt8).malloc(@capacity)
+    end
+
+    def closed? : Bool
+      @closed.get(:acquire) != 0
     end
 
     def write(slice : Bytes) : Nil
       remaining = slice
 
       while remaining.size > 0
-        channel = nil
-        wake = nil
+        raise IO::Error.new("Closed stream") if @closed.get(:acquire) != 0
 
-        @mutex.synchronize do
-          raise IO::Error.new("Closed stream") if @closed
+        head = @head_count.get(:relaxed) # the writer owns the head
+        tail = @tail_count.get(:acquire)
+        space = @capacity &- (head &- tail).to_i32
 
-          space = @capacity &- @size
-          if space > 0
-            to_write = Math.min(space, remaining.size)
+        if space > 0
+          to_write = Math.min(space, remaining.size)
 
-            # We write in 1-2 chunks. If the first write exceeds the available
-            # space at the end of the buffer, we wrap around to the beginning
-            # and write the rest there.
-            first_chunk = Math.min(to_write, @capacity - @head)
-            (@data + @head).copy_from(remaining.to_unsafe, first_chunk)
+          # We write in 1-2 chunks. If the first write exceeds the available
+          # space at the end of the buffer, we wrap around to the beginning
+          # and write the rest there.
+          index = @head_index
+          first_chunk = Math.min(to_write, @capacity &- index)
+          (@data + index).copy_from(remaining.to_unsafe, first_chunk)
 
-            if to_write > first_chunk
-              second_chunk = to_write - first_chunk
-              @data.copy_from(remaining.to_unsafe + first_chunk, second_chunk)
-            end
+          if to_write > first_chunk
+            second_chunk = to_write &- first_chunk
+            @data.copy_from(remaining.to_unsafe + first_chunk, second_chunk)
+          end
 
-            # Advance the write position, wrapping around the end of the ring
-            # buffer. `head` stays in `0...@capacity` and we advance by at most
-            # `capacity`, so a single conditional subtraction is equivalent to
-            # (and cheaper than) a modulo by `capacity`.
-            @head &+= to_write
-            @head &-= @capacity if @head >= @capacity
-            @size &+= to_write
-            remaining = remaining[to_write..]
+          # Advance the write position, wrapping around the end of the ring
+          # buffer. `index` stays in `0...@capacity` and we advance by at most
+          # `capacity`, so a single conditional subtraction is equivalent to
+          # (and cheaper than) a modulo by `capacity`.
+          index &+= to_write
+          index &-= @capacity if index >= @capacity
+          @head_index = index
 
-            if reader = @waiting_reader
-              @waiting_reader = nil
-              wake = reader
-            end
+          # Publish the new head. Must come after the copy and before the wake
+          # check below — see #wake_reader.
+          @head_count.set(head &+ to_write, :release)
+          remaining = remaining[to_write..]
+
+          wake_reader
+        else
+          # The buffer is full, so we wait for the reader. Register first, then
+          # re-check that the buffer is still full before parking, so we can't
+          # miss a reader that frees space in between (a lost wakeup).
+          @waiting_writer.set(@wakeup, :sequentially_consistent)
+          tail = @tail_count.get(:sequentially_consistent)
+          if @capacity &- (head &- tail).to_i32 > 0
+            @waiting_writer.set(nil, :relaxed)
           else
-            # The buffer is full, so we wait for the reader
-            channel = @wakeup
-            @waiting_writer = channel
+            @wakeup.receive?
           end
         end
-
-        # Wake the parked reader only after releasing the mutex so it doesn't
-        # resume just to contend for a lock we still hold.
-        wake.try &.send(nil)
-        channel.try &.receive?
       end
     end
 
@@ -84,65 +110,83 @@ module Pipe
       return 0 if slice.empty?
 
       loop do
-        channel = nil
-        wake = nil
-        read_count = 0
+        tail = @tail_count.get(:relaxed) # the reader owns the tail
+        head = @head_count.get(:acquire)
+        size = (head &- tail).to_i32
 
-        @mutex.synchronize do
-          if @size > 0
-            to_read = Math.min(@size, slice.size)
+        if size > 0
+          to_read = Math.min(size, slice.size)
 
-            # Just like in writing, the amount we're trying to read may be more
-            # than is available at the end of the buffer, which requires
-            # wrapping around to the beginning. This means we need to read in 2
-            # separate chunks.
-            first_chunk = Math.min(to_read, @capacity &- @tail)
-            slice.to_unsafe.copy_from(@data + @tail, first_chunk)
+          # Just like in writing, the amount we're trying to read may be more
+          # than is available at the end of the buffer, which requires
+          # wrapping around to the beginning. This means we need to read in 2
+          # separate chunks.
+          index = @tail_index
+          first_chunk = Math.min(to_read, @capacity &- index)
+          slice.to_unsafe.copy_from(@data + index, first_chunk)
 
-            if to_read > first_chunk
-              second_chunk = to_read &- first_chunk
-              (slice.to_unsafe + first_chunk).copy_from(@data, second_chunk)
-            end
+          if to_read > first_chunk
+            second_chunk = to_read &- first_chunk
+            (slice.to_unsafe + first_chunk).copy_from(@data, second_chunk)
+          end
 
-            # See the matching note in #write: a conditional subtraction wraps
-            # @tail around the ring buffer more cheaply than a modulo.
-            @tail &+= to_read
-            @tail &-= @capacity if @tail >= @capacity
-            @size &-= to_read
-            read_count = to_read
+          # See the matching note in #write: a conditional subtraction wraps
+          # the read position around the ring buffer more cheaply than a modulo.
+          index &+= to_read
+          index &-= @capacity if index >= @capacity
+          @tail_index = index
 
-            if writer = @waiting_writer
-              @waiting_writer = nil
-              wake = writer
-            end
-          elsif @closed
-            return 0
+          @tail_count.set(tail &+ to_read, :release)
+
+          wake_writer
+          return to_read
+        elsif @closed.get(:acquire) != 0
+          return 0
+        else
+          # The buffer is empty, so wait for the writer. Register first, then
+          # re-check for data (or close) before parking — see the matching note
+          # in #write about lost wakeups.
+          @waiting_reader.set(@wakeup, :sequentially_consistent)
+          head = @head_count.get(:sequentially_consistent)
+          if (head &- tail).to_i32 > 0 || @closed.get(:acquire) != 0
+            @waiting_reader.set(nil, :relaxed)
           else
-            # The buffer is empty, so wait for the writer
-            channel = @wakeup
-            @waiting_reader = channel
+            @wakeup.receive?
           end
         end
-
-        # See the matching note in #write: wake the parked writer only after
-        # releasing the mutex.
-        wake.try &.send(nil)
-        return read_count if read_count > 0
-        channel.try &.receive?
       end
     end
 
     def close : Nil
-      @mutex.synchronize do
-        @closed = true
-        if reader = @waiting_reader
-          @waiting_reader = nil
-          reader.send(nil)
-        end
-        if writer = @waiting_writer
-          @waiting_writer = nil
-          writer.send(nil)
-        end
+      @closed.set(1, :sequentially_consistent)
+      if reader = @waiting_reader.swap(nil, :acquire_release)
+        reader.send(nil)
+      end
+      if writer = @waiting_writer.swap(nil, :acquire_release)
+        writer.send(nil)
+      end
+    end
+
+    # Wake a parked reader after publishing data. The fence orders the head
+    # publish (above) before we observe the waiter slot, mirroring the parking
+    # side which registers the slot and *then* re-reads the head. Without that
+    # ordering both could miss each other and the reader would park forever.
+    # The fence pairs with a relaxed load so the common case — nobody parked —
+    # avoids writing the (reader-owned) waiter cache line on every call.
+    private def wake_reader : Nil
+      Atomic.fence(:sequentially_consistent)
+      return if @waiting_reader.get(:relaxed).nil?
+      if reader = @waiting_reader.swap(nil, :acquire_release)
+        reader.send(nil)
+      end
+    end
+
+    # The mirror image of #wake_reader, run by the reader after freeing space.
+    private def wake_writer : Nil
+      Atomic.fence(:sequentially_consistent)
+      return if @waiting_writer.get(:relaxed).nil?
+      if writer = @waiting_writer.swap(nil, :acquire_release)
+        writer.send(nil)
       end
     end
   end
